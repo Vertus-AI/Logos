@@ -1,0 +1,84 @@
+name: Security scanning
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Newer commits cancel older runs of the same PR. Other events get a unique group, so nothing
+# on a branch push or schedule is ever cancelled or dropped.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # The gitleaks GitHub Action needs a paid license for organizations, so
+      # the pinned upstream container is run directly instead. Same scanner,
+      # same rules, scans the full git history and fails on any leak.
+      # Only the commits new to this PR or push are scanned, so a new leak
+      # blocks the change without the job failing forever on history that
+      # still needs triage (doc examples, test fixtures, and the known
+      # committed secrets tracked in the launch remediation plan).
+      - name: Scan new commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ -z "$BASE_SHA" ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="$HEAD_SHA -n 50"
+          else
+            RANGE="$BASE_SHA..$HEAD_SHA"
+          fi
+          echo "scanning: $RANGE"
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --exit-code 1 --no-banner --log-opts="$RANGE"
+
+  trivy:
+    name: Dependency scan (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Vulnerabilities (fixable HIGH/CRITICAL fail the job)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Misconfigurations (report only for now)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+  semgrep:
+    name: Static analysis (semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: mirror.gcr.io/semgrep/semgrep:1.164.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Report only for now: the first runs flag pre-existing workflow hygiene
+      # (unpinned action tags, dependabot cooldown). Add --error once those
+      # are cleaned up so new findings block.
+      - run: semgrep scan --config p/ci --config p/secrets --config p/github-actions --metrics=off
